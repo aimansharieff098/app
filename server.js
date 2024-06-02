@@ -1,103 +1,108 @@
 const express = require('express');
 const path = require('path');
-const mysql = require('mysql2/promise');
+const mysql = require('mysql');
 const session = require('express-session');
-const bcrypt = require('bcrypt');
-const passport = require('passport');
-const LocalStrategy = require('passport-local').Strategy;
-const flash = require('express-flash');
+const { register, collectDefaultMetrics, Counter } = require('prom-client');
+const winston = require('winston');
+const LokiTransport = require('winston-loki');
+
+// Initialize Prometheus default metrics collection
+collectDefaultMetrics();
+
+// Configure the Loki logger
+const logger = winston.createLogger({
+    transports: [
+        new LokiTransport({
+            host: 'http://3.108.60.240:3100', // Replace with your Loki host and port
+            labels: { app: 'nodejs-app' },
+            json: true,
+            format: winston.format.json(),
+        })
+    ]
+});
+
+// Additional logger for errors
+const errorLogger = winston.createLogger({
+    transports: [
+        new LokiTransport({
+            host: 'http://3.108.60.240:3100', // Replace with your Loki host and port
+            labels: { app: 'nodejs-app', type: 'error' }, // Additional label to distinguish error logs
+            json: true,
+            format: winston.format.json(),
+        })
+    ]
+});
 
 const app = express();
-const port = 3000;
+const port = 8000;
 
-// Asynchronous Database Connection Initialization
-let connection;
-(async function initializeDatabase() {
-    try {
-        connection = await mysql.createConnection({
-            host: 'localhost',
-            user: 'root',
-            password: 'root',
-            database: 'database'
-        });
-        console.log('Connected to MySQL server');
-    } catch (err) {
-        console.error('Error connecting to MySQL server:', err);
+const connection = mysql.createConnection({
+    host: 'zoeencloud-rds.cn2m8c6mk6nl.ap-south-1.rds.amazonaws.com', //rds endpoint
+    user: 'admin',
+    password: 'Admin123123',
+    database: 'bd'
+});
+
+connection.connect((err) => {
+    if (err) {
+        logger.error('Error connecting to MySQL server', { error: err });
+        return;
     }
-})();
+    logger.info('Connected to MySQL server');
 
-// Middleware Setup
+    // Check if the table exists and create it if it doesn't
+    const createTableQuery = `
+        CREATE TABLE IF NOT EXISTS login_details (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(255) NOT NULL,
+            email_id VARCHAR(255) NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    `;
+
+    connection.query(createTableQuery, (err, result) => {
+        if (err) {
+            logger.error('Error creating table', { error: err });
+            return;
+        }
+        logger.info('Table exists or created successfully');
+    });
+});
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(__dirname));
-app.use(flash());
 
 app.use(session({
     secret: 'secret',
     resave: false,
-    saveUninitialized: false,
-    cookie: { maxAge: 60000 } // 1 minute for demonstration purposes
+    saveUninitialized: true
 }));
 
-app.use(passport.initialize());
-app.use(passport.session());
-
-// Passport Local Strategy
-passport.use(new LocalStrategy(async (username, password, done) => {
-    try {
-        const [users] = await connection.execute('SELECT * FROM new_table WHERE username = ?', [username]);
-        if (users.length > 0) {
-            const user = users[0];
-            const passwordMatch = await bcrypt.compare(password, user.password);
-            if (passwordMatch) {
-                return done(null, user);
-            } else {
-                return done(null, false, { message: 'Invalid username or password' });
-            }
-        } else {
-            return done(null, false, { message: 'Invalid username or password' });
-        }
-    } catch (error) {
-        return done(error);
-    }
-}));
-
-passport.serializeUser((user, done) => {
-    done(null, user.username);
+// Custom Prometheus metrics
+const httpRequestCounter = new Counter({
+    name: 'http_requests_total',
+    help: 'Total number of HTTP requests',
+    labelNames: ['method', 'route', 'status_code']
 });
 
-passport.deserializeUser(async (username, done) => {
-    try {
-        const [users] = await connection.execute('SELECT * FROM new_table WHERE username = ?', [username]);
-        if (users.length > 0) {
-            done(null, users[0]);
-        } else {
-            done(null, false);
-        }
-    } catch (error) {
-        done(error);
-    }
+app.use((req, res, next) => {
+    res.on('finish', () => {
+        httpRequestCounter.inc({
+            method: req.method,
+            route: req.route ? req.route.path : 'unknown',
+            status_code: res.statusCode
+        });
+    });
+    next();
 });
 
-// Helper function to execute queries
-async function executeQuery(sql, values) {
-    try {
-        const [results] = await connection.execute(sql, values);
-        return results;
-    } catch (error) {
-        throw error;
-    }
-}
-
-// Middleware to ensure authentication
-function ensureAuthenticated(req, res, next) {
-    if (req.isAuthenticated()) {
-        return next();
-    }
-    res.redirect('/login');
-}
-
-// Routes
+// Expose Prometheus metrics endpoint
+app.get('/metrics', async (req, res) => {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+});
 app.get('/', (req, res) => {
     res.redirect('/login');
 });
@@ -110,11 +115,17 @@ app.get('/signup', (req, res) => {
     res.sendFile(path.join(__dirname, 'signup.html'));
 });
 
-app.get('/dashboard', ensureAuthenticated, (req, res) => {
+app.get('/dashboard', (req, res) => {
+    if (!req.session.username) {
+        return res.redirect('/login');
+    }
     res.sendFile(path.join(__dirname, 'dashboard.html'));
 });
 
-app.get('/cart', ensureAuthenticated, (req, res) => {
+app.get('/cart', (req, res) => {
+    if (!req.session.username) {
+        return res.redirect('/login');
+    }
     res.sendFile(path.join(__dirname, 'cart.html'));
 });
 
@@ -168,26 +179,36 @@ app.post('/clear-cart', (req, res) => {
 app.post('/signup', async (req, res) => {
     const { username, email_id, password } = req.body;
 
-    if (!username || !email_id || !password) {
-        return res.status(400).send('Invalid signup data');
-    }
-
     try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-        await executeQuery('INSERT INTO new_table (username, email_id, password) VALUES (?, ?, ?)', [username, email_id, hashedPassword]);
+        await executeQuery('INSERT INTO login_details (username, email_id, password) VALUES (?, ?, ?)', [username, email_id, password]);
         res.redirect('/login');
+        logger.info('User signed up', { username, email_id });
     } catch (error) {
-        console.error('Signup error:', error);
         res.status(500).send('Failed to sign up');
+        errorLogger.error('Signup failed', { error });
     }
 });
 
-app.post('/login', passport.authenticate('local', {
-    successRedirect: '/dashboard',
-    failureRedirect: '/login',
-    failureFlash: true
-}));
+app.post('/login', async (req, res) => {
+    const { username, password } = req.body;
+
+    try {
+        const users = await executeQuery('SELECT * FROM login_details WHERE username = ? AND password = ?', [username, password]);
+
+        if (users.length > 0) {
+            req.session.username = username;
+            res.redirect('/dashboard');
+            logger.info('User logged in', { username });
+        } else {
+            res.status(401).send('Invalid username or password');
+            errorLogger.warn('Invalid login attempt', { username });
+        }
+    } catch (error) {
+        res.status(500).send('Failed to login');
+        errorLogger.error('Login failed', { error });
+    }
+});
 
 app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+    logger.info(Server running on port ${port});
 });
